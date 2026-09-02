@@ -30,6 +30,27 @@ try
             "non-placeholder shape should inherit color from its local list style");
         Assert(html.Contains("font-family:'OPPOSans M'", StringComparison.Ordinal),
             "non-placeholder shape should inherit typeface from its local list style");
+        Assert(html.Contains("font-size:17pt", StringComparison.Ordinal),
+            "placeholder should inherit font size from the master body text style");
+        Assert(html.Contains("color:#123456", StringComparison.Ordinal),
+            "placeholder should inherit color from the matching master placeholder");
+        Assert(html.Contains("font-family:'Master Placeholder'", StringComparison.Ordinal),
+            "placeholder should inherit typeface from the matching master placeholder");
+        Assert(html.Contains("text-align:center", StringComparison.Ordinal),
+            "placeholder should inherit alignment from the matching layout placeholder");
+        Assert(html.Contains("padding-left:20pt", StringComparison.Ordinal),
+            "placeholder should continue past a partial layout style to the master placeholder margin");
+        Assert(html.Contains("padding-right:10pt", StringComparison.Ordinal),
+            "placeholder should continue to the presentation default text style for missing properties");
+        Assert(html.Contains("margin-bottom:6pt", StringComparison.Ordinal),
+            "placeholder should merge paragraph spacing from the master body text style");
+        var inheritanceText = html.IndexOf("master inheritance cascade", StringComparison.Ordinal);
+        Assert(inheritanceText >= 0, "master inheritance fixture text should render");
+        var inheritanceContext = html[Math.Max(0, inheritanceText - 1200)..inheritanceText];
+        Assert(inheritanceContext.Contains("font-weight:bold", StringComparison.Ordinal),
+            "placeholder should inherit bold from the matching layout placeholder");
+        Assert(inheritanceContext.Contains("font-style:italic", StringComparison.Ordinal),
+            "placeholder should continue to the master placeholder for missing italic style");
         Assert(html.Contains("1/1/2024", StringComparison.Ordinal),
             "date-axis serial categories should use the axis number format");
         var renderedDateLabels = CountOccurrences(html, "/2024");
@@ -110,6 +131,8 @@ static void CreateFixture(string path)
             });
         builder.Add("/slide[1]", "textbox", position: null,
             properties: new Dictionary<string, string> { ["text"] = "no-fill text outline", ["y"] = "17cm" });
+        builder.Add("/slide[1]", "textbox", position: null,
+            properties: new Dictionary<string, string> { ["text"] = "master inheritance cascade", ["y"] = "18cm" });
         builder.Add("/slide[1]", "chart", position: null,
             properties: new Dictionary<string, string>
             {
@@ -165,12 +188,137 @@ static void CreateFixture(string path)
             shapes.Single(shape => shape.InnerText.Contains("dashed custom path", StringComparison.OrdinalIgnoreCase)));
         ConfigureNoFillTextOutlineFixture(
             shapes.Single(shape => shape.InnerText.Contains("no-fill text outline", StringComparison.OrdinalIgnoreCase)));
+        ConfigureMasterInheritanceFixture(
+            document,
+            shapes.Single(shape => shape.InnerText.Contains("master inheritance cascade", StringComparison.OrdinalIgnoreCase)));
         ConfigureWpsDateAxis(document);
         slide.Save();
     }
 
     using var checker = new PowerPointHandler(path, editable: false);
-    Assert(checker.Validate().Count == 0, "generated PPTX fixture should pass schema validation");
+    var validationErrors = checker.Validate();
+    Assert(validationErrors.Count == 0,
+        $"generated PPTX fixture should pass schema validation: {string.Join(" | ", validationErrors)}");
+}
+
+static void ConfigureMasterInheritanceFixture(PresentationDocument document, Shape slideShape)
+{
+    const uint placeholderIndex = 77;
+    var slidePart = document.PresentationPart!.SlideParts.Single();
+    var layoutPart = slidePart.SlideLayoutPart!;
+    var masterPart = layoutPart.SlideMasterPart!;
+
+    SetPlaceholder(slideShape, placeholderIndex);
+    slideShape.TextBody!.GetFirstChild<Drawing.ListStyle>()?.Remove();
+    slideShape.TextBody.InsertAfter(new Drawing.ListStyle(),
+        slideShape.TextBody.GetFirstChild<Drawing.BodyProperties>());
+    slideShape.TextBody.AppendChild(new Drawing.Paragraph(
+        new Drawing.Run(new Drawing.Text("master cascade second paragraph"))));
+
+    var layoutShape = (Shape)slideShape.CloneNode(true);
+    SetShapeIdentity(layoutShape, 9001U, "Master cascade layout placeholder");
+    ClearShapeText(layoutShape);
+    SetPlaceholder(layoutShape, placeholderIndex);
+    SetListStyle(layoutShape, new Drawing.Level1ParagraphProperties(
+        new Drawing.DefaultRunProperties { Bold = true })
+    {
+        Alignment = Drawing.TextAlignmentTypeValues.Center,
+    });
+    layoutPart.SlideLayout!.CommonSlideData!.ShapeTree!.AppendChild(layoutShape);
+
+    var masterShape = (Shape)slideShape.CloneNode(true);
+    SetShapeIdentity(masterShape, 9002U, "Master cascade master placeholder");
+    ClearShapeText(masterShape);
+    SetPlaceholder(masterShape, placeholderIndex);
+    var masterPlaceholderRunProperties = new Drawing.DefaultRunProperties
+    {
+        Italic = true,
+    };
+    masterPlaceholderRunProperties.Append(
+        new Drawing.SolidFill(new Drawing.RgbColorModelHex { Val = "123456" }),
+        new Drawing.LatinFont { Typeface = "Master Placeholder" },
+        new Drawing.EastAsianFont { Typeface = "Master Placeholder" },
+        new Drawing.ComplexScriptFont { Typeface = "Master Placeholder" });
+    SetListStyle(masterShape, new Drawing.Level1ParagraphProperties(masterPlaceholderRunProperties)
+    {
+        LeftMargin = 254000,
+    });
+    masterPart.SlideMaster!.CommonSlideData!.ShapeTree!.AppendChild(masterShape);
+
+    var textStyles = masterPart.SlideMaster.TextStyles;
+    if (textStyles == null)
+    {
+        textStyles = new TextStyles(new TitleStyle(), new BodyStyle(), new OtherStyle());
+        masterPart.SlideMaster.TextStyles = textStyles;
+    }
+    var bodyStyle = textStyles.BodyStyle ?? textStyles.AppendChild(new BodyStyle());
+    var masterBodyLevel = bodyStyle.GetFirstChild<Drawing.Level1ParagraphProperties>();
+    if (masterBodyLevel == null)
+    {
+        masterBodyLevel = new Drawing.Level1ParagraphProperties();
+        bodyStyle.AppendChild(masterBodyLevel);
+    }
+    var bodyRunProperties = masterBodyLevel.GetFirstChild<Drawing.DefaultRunProperties>();
+    if (bodyRunProperties == null)
+    {
+        bodyRunProperties = new Drawing.DefaultRunProperties();
+        masterBodyLevel.AppendChild(bodyRunProperties);
+    }
+    bodyRunProperties.FontSize = 1700;
+    masterBodyLevel.RemoveAllChildren<Drawing.SpaceAfter>();
+    masterBodyLevel.InsertBefore(
+        new Drawing.SpaceAfter(new Drawing.SpacingPoints { Val = 600 }),
+        bodyRunProperties);
+
+    var presentation = document.PresentationPart.Presentation!;
+    var defaultTextStyle = presentation.DefaultTextStyle;
+    if (defaultTextStyle == null)
+    {
+        defaultTextStyle = new DefaultTextStyle();
+        presentation.DefaultTextStyle = defaultTextStyle;
+    }
+    var presentationLevel = defaultTextStyle.GetFirstChild<Drawing.Level1ParagraphProperties>();
+    if (presentationLevel == null)
+    {
+        presentationLevel = new Drawing.Level1ParagraphProperties();
+        defaultTextStyle.AppendChild(presentationLevel);
+    }
+    presentationLevel.RightMargin = 127000;
+
+    layoutPart.SlideLayout.Save();
+    masterPart.SlideMaster.Save();
+    presentation.Save();
+}
+
+static void SetListStyle(Shape shape, Drawing.Level1ParagraphProperties level)
+{
+    shape.TextBody!.GetFirstChild<Drawing.ListStyle>()?.Remove();
+    shape.TextBody.InsertAfter(new Drawing.ListStyle(level),
+        shape.TextBody.GetFirstChild<Drawing.BodyProperties>());
+}
+
+static void SetPlaceholder(Shape shape, uint index)
+{
+    var applicationProperties = shape.NonVisualShapeProperties!
+        .ApplicationNonVisualDrawingProperties!;
+    applicationProperties.RemoveAllChildren<PlaceholderShape>();
+    applicationProperties.AppendChild(new PlaceholderShape
+    {
+        Index = index,
+        Type = PlaceholderValues.Body,
+    });
+}
+
+static void SetShapeIdentity(Shape shape, uint id, string name)
+{
+    var properties = shape.NonVisualShapeProperties!.NonVisualDrawingProperties!;
+    properties.Id = id;
+    properties.Name = name;
+}
+
+static void ClearShapeText(Shape shape)
+{
+    foreach (var text in shape.Descendants<Drawing.Text>()) text.Text = string.Empty;
 }
 
 static void ConfigureNoFillTextOutlineFixture(Shape shape)
@@ -222,7 +370,8 @@ static void ConfigureWideChevronFixture(Shape shape)
     var shapeProperties = shape.ShapeProperties!;
     shapeProperties.GetFirstChild<Drawing.PresetGeometry>()?.Remove();
     shapeProperties.AddChild(new Drawing.PresetGeometry(
-        new Drawing.AdjustValueList()) { Preset = Drawing.ShapeTypeValues.Chevron }, true);
+        new Drawing.AdjustValueList())
+    { Preset = Drawing.ShapeTypeValues.Chevron }, true);
     shapeProperties.Transform2D!.Extents!.Cx = 2880000;
     shapeProperties.Transform2D.Extents.Cy = 360000;
 }
@@ -240,7 +389,8 @@ static void ConfigureReverseGradientFixture(Shape shape)
         new Drawing.GradientStopList(
             new Drawing.GradientStop(transparentWhite) { Position = 77000 },
             new Drawing.GradientStop(
-                new Drawing.SchemeColor { Val = Drawing.SchemeColorValues.Background1 }) { Position = 30000 }),
+                new Drawing.SchemeColor { Val = Drawing.SchemeColorValues.Background1 })
+            { Position = 30000 }),
         new Drawing.LinearGradientFill { Angle = 5400000, Scaled = true });
     shapeProperties.AddChild(gradient, true);
 }

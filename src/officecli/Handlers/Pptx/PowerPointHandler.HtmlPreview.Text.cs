@@ -92,37 +92,16 @@ public partial class PowerPointHandler
                 inheritedLineSpacing = ResolvePlaceholderLineSpacing(placeholderShape, placeholderPart, level);
                 // Any inherited lvlNpPr (for alignment/spacing/bullet); take the
                 // first level pPr that carries ANY content in the chain.
-                inheritedLvlPpr = ResolvePlaceholderLevelPpr(placeholderShape, placeholderPart, level, _ => true);
-                inheritedDefRp = ResolvePlaceholderDefRp(placeholderShape, placeholderPart, level,
-                    dr => dr.Bold?.HasValue == true || dr.Italic?.HasValue == true);
-                // Caps (cap="all"/"small") is resolved with its OWN predicate, not folded
-                // into the bold/italic lookup: many themes apply all-caps to title/body
-                // placeholders via the master/layout defRPr with NO bold or italic, so the
-                // bold/italic predicate never matched and inherited caps was silently
-                // dropped (PowerPoint renders uppercase; the preview rendered mixed case).
-                // A dedicated lookup also avoids cross-level contamination (caps on one
-                // inheritance level, bold on another).
-                inheritedCapsRp = ResolvePlaceholderDefRp(placeholderShape, placeholderPart, level,
-                    dr => dr.Capital?.HasValue == true);
-                // Underline / strike from a master/layout placeholder defRPr get their
-                // OWN dedicated lookups too (same reasoning as caps): a theme may set
-                // u="sng"/strike on a placeholder level's defRPr with no bold/italic, so
-                // the bold/italic predicate never matched and the decoration was dropped
-                // (PowerPoint renders the underline; the preview rendered plain text).
-                inheritedUnderlineRp = ResolvePlaceholderDefRp(placeholderShape, placeholderPart, level,
-                    dr => dr.Underline?.HasValue == true);
-                inheritedStrikeRp = ResolvePlaceholderDefRp(placeholderShape, placeholderPart, level,
-                    dr => dr.Strike?.HasValue == true);
-                // Character spacing (spc) gets its own dedicated lookup too: a theme may
-                // set spc on a placeholder level's defRPr with no bold/italic, so the
-                // bold/italic predicate never matched and the inherited tracking was
-                // dropped (PowerPoint renders wide tracking; the preview rendered normal).
-                inheritedSpacingRp = ResolvePlaceholderDefRp(placeholderShape, placeholderPart, level,
-                    dr => dr.Spacing?.HasValue == true);
-                inheritedTypefaceRp = ResolvePlaceholderDefRp(placeholderShape, placeholderPart, level,
-                    dr => dr.GetFirstChild<Drawing.LatinFont>() != null
-                        || dr.GetFirstChild<Drawing.EastAsianFont>() != null
-                        || dr.GetFirstChild<Drawing.ComplexScriptFont>() != null);
+                inheritedLvlPpr = ResolveMergedPlaceholderLevelPpr(
+                    placeholderShape, placeholderPart, level);
+                var inheritedRunProperties = ResolveMergedPlaceholderDefRp(
+                    placeholderShape, placeholderPart, level);
+                inheritedDefRp = inheritedRunProperties;
+                inheritedCapsRp = inheritedRunProperties;
+                inheritedUnderlineRp = inheritedRunProperties;
+                inheritedStrikeRp = inheritedRunProperties;
+                inheritedSpacingRp = inheritedRunProperties;
+                inheritedTypefaceRp = inheritedRunProperties;
             }
             // R11-3: style-matrix fontRef schemeClr is the FINAL fallback run color
             // when no explicit run color and no inherited placeholder color is found.

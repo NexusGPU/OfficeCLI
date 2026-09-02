@@ -1154,67 +1154,19 @@ public partial class PowerPointHandler
     /// </summary>
     private static int? ResolvePlaceholderFontSize(Shape shape, OpenXmlPart part, int level = 0)
     {
-        // Shape-local list styles apply to every text shape, not only placeholders.
-        var lstStyle = shape.TextBody?.GetFirstChild<Drawing.ListStyle>();
-        var defRp = GetLevelDefRp(lstStyle, level);
-        if (defRp?.FontSize?.HasValue == true)
-            return defRp.FontSize.Value;
-
         var ph = shape.NonVisualShapeProperties?.ApplicationNonVisualDrawingProperties
             ?.GetFirstChild<PlaceholderShape>();
-        if (ph == null) return null; // Not a placeholder
+        var defRp = ResolvePlaceholderDefRp(shape, part, level,
+            candidate => candidate.FontSize?.HasValue == true);
+        if (defRp?.FontSize?.HasValue == true) return defRp.FontSize.Value;
+        if (ph == null) return null;
 
         // Determine placeholder category
         var phType = ph.Type?.HasValue == true ? ph.Type.Value : PlaceholderValues.Body;
         bool isTitle = phType == PlaceholderValues.Title || phType == PlaceholderValues.CenteredTitle;
         bool isSubTitle = phType == PlaceholderValues.SubTitle;
 
-        // 2. Check layout and master placeholder matching shapes for inherited font size
-        if (part is SlidePart slidePart)
-        {
-            var layoutTree = slidePart.SlideLayoutPart?.SlideLayout?.CommonSlideData?.ShapeTree;
-            var masterTree = slidePart.SlideLayoutPart?.SlideMasterPart?.SlideMaster?.CommonSlideData?.ShapeTree;
-
-            foreach (var tree in new[] { layoutTree, masterTree })
-            {
-                if (tree == null) continue;
-                foreach (var candidate in tree.Elements<Shape>())
-                {
-                    var cPh = candidate.NonVisualShapeProperties?.ApplicationNonVisualDrawingProperties
-                        ?.GetFirstChild<PlaceholderShape>();
-                    if (cPh == null) continue;
-                    if (!PlaceholderMatches(ph, cPh)) continue;
-
-                    // Check candidate's list style at the correct level
-                    var cLstStyle = candidate.TextBody?.GetFirstChild<Drawing.ListStyle>();
-                    var cDefRp = GetLevelDefRp(cLstStyle, level);
-                    if (cDefRp?.FontSize?.HasValue == true)
-                        return cDefRp.FontSize.Value;
-                }
-            }
-
-            // 3. Check master text styles (titleStyle for titles, bodyStyle for body, otherStyle for others)
-            var masterTxStyles = slidePart.SlideLayoutPart?.SlideMasterPart?.SlideMaster?.TextStyles;
-            if (masterTxStyles != null)
-            {
-                OpenXmlCompositeElement? styleList = null;
-                if (isTitle)
-                    styleList = masterTxStyles.TitleStyle;
-                else if (isSubTitle || phType == PlaceholderValues.Body || phType == PlaceholderValues.Object)
-                    styleList = masterTxStyles.BodyStyle;
-                else
-                    styleList = masterTxStyles.OtherStyle;
-
-                if (styleList != null)
-                {
-                    var sDefRp = GetLevelDefRp(styleList, level);
-                    if (sDefRp?.FontSize?.HasValue == true)
-                        return sDefRp.FontSize.Value;
-                }
-            }
-        }
-
-        // 4. OOXML spec defaults: Title=44pt, SubTitle=32pt, Body=24pt
+        // OOXML spec defaults: Title=44pt, SubTitle=32pt, Body=24pt
         if (isTitle) return 4400;
         if (isSubTitle) return 3200;
 
@@ -1268,6 +1220,38 @@ public partial class PowerPointHandler
         return lvlPpr?.GetFirstChild<Drawing.DefaultRunProperties>();
     }
 
+    private static Drawing.DefaultRunProperties? ResolveMergedPlaceholderDefRp(
+        Shape shape, OpenXmlPart part, int level)
+    {
+        Drawing.DefaultRunProperties? merged = null;
+        foreach (var levelProperties in EnumeratePlaceholderLevelPprs(shape, part, level))
+        {
+            var source = levelProperties.GetFirstChild<Drawing.DefaultRunProperties>();
+            if (source == null) continue;
+            if (merged == null)
+            {
+                merged = (Drawing.DefaultRunProperties)source.CloneNode(true);
+                continue;
+            }
+
+            foreach (var attribute in source.GetAttributes())
+            {
+                if (merged.GetAttributes().Any(existing =>
+                    existing.LocalName == attribute.LocalName && existing.NamespaceUri == attribute.NamespaceUri))
+                    continue;
+                merged.SetAttribute(attribute);
+            }
+
+            foreach (var child in source.ChildElements.Where(element =>
+                element is Drawing.LatinFont or Drawing.EastAsianFont or Drawing.ComplexScriptFont))
+            {
+                if (merged.ChildElements.Any(existing => existing.GetType() == child.GetType())) continue;
+                merged.AppendChild(child.CloneNode(true));
+            }
+        }
+        return merged;
+    }
+
     /// <summary>
     /// Shared inheritance walk that returns the first level-paragraph-properties element
     /// (Level1ParagraphProperties etc.) in the placeholder chain matching <paramref name="match"/>.
@@ -1275,49 +1259,113 @@ public partial class PowerPointHandler
     private static OpenXmlElement? ResolvePlaceholderLevelPpr(Shape shape, OpenXmlPart part,
         int level, Func<OpenXmlElement, bool> match)
     {
-        // Shape-local list styles apply before any placeholder cascade and remain
-        // effective for ordinary textboxes and autoshapes.
-        var lstStyle = shape.TextBody?.GetFirstChild<Drawing.ListStyle>();
-        if (GetLevelPpr(lstStyle, level) is { } own && match(own)) return own;
+        foreach (var candidate in EnumeratePlaceholderLevelPprs(shape, part, level))
+            if (match(candidate)) return candidate;
+        return null;
+    }
+
+    private static OpenXmlElement? ResolveMergedPlaceholderLevelPpr(
+        Shape shape, OpenXmlPart part, int level)
+    {
+        OpenXmlElement? merged = null;
+        foreach (var source in EnumeratePlaceholderLevelPprs(shape, part, level))
+        {
+            if (merged == null)
+            {
+                merged = source.CloneNode(true);
+                continue;
+            }
+            MergeMissingLevelProperties(merged, source);
+        }
+        return merged;
+    }
+
+    private static IEnumerable<OpenXmlElement> EnumeratePlaceholderLevelPprs(
+        Shape shape, OpenXmlPart part, int level)
+    {
+        var ownStyle = shape.TextBody?.GetFirstChild<Drawing.ListStyle>();
+        if (GetLevelPpr(ownStyle, level) is { } own) yield return own;
 
         var ph = shape.NonVisualShapeProperties?.ApplicationNonVisualDrawingProperties
             ?.GetFirstChild<PlaceholderShape>();
-        if (ph == null) return null;
-
-        var phType = ph.Type?.HasValue == true ? ph.Type.Value : PlaceholderValues.Body;
-        bool isTitle = phType == PlaceholderValues.Title || phType == PlaceholderValues.CenteredTitle;
-        bool isSubTitle = phType == PlaceholderValues.SubTitle;
+        if (ph == null) yield break;
 
         if (part is SlidePart slidePart)
         {
             var layoutTree = slidePart.SlideLayoutPart?.SlideLayout?.CommonSlideData?.ShapeTree;
-            var masterTree = slidePart.SlideLayoutPart?.SlideMasterPart?.SlideMaster?.CommonSlideData?.ShapeTree;
-            foreach (var tree in new[] { layoutTree, masterTree })
+            if (MatchingPlaceholderLevelPpr(layoutTree, ph, level) is { } layoutPpr)
+                yield return layoutPpr;
+        }
+
+        var masterPart = part switch
             {
-                if (tree == null) continue;
+            SlidePart slide => slide.SlideLayoutPart?.SlideMasterPart,
+            SlideLayoutPart layout => layout.SlideMasterPart,
+            SlideMasterPart master => master,
+            _ => null,
+        };
+        var masterTree = masterPart?.SlideMaster?.CommonSlideData?.ShapeTree;
+        if (MatchingPlaceholderLevelPpr(masterTree, ph, level) is { } masterPpr)
+            yield return masterPpr;
+
+        var phType = ph.Type?.HasValue == true ? ph.Type.Value : PlaceholderValues.Body;
+        var isTitle = phType == PlaceholderValues.Title || phType == PlaceholderValues.CenteredTitle;
+        var isSubTitle = phType == PlaceholderValues.SubTitle;
+        var masterTextStyles = masterPart?.SlideMaster?.TextStyles;
+        OpenXmlCompositeElement? masterStyle = isTitle ? masterTextStyles?.TitleStyle
+            : (isSubTitle || phType == PlaceholderValues.Body || phType == PlaceholderValues.Object)
+                ? masterTextStyles?.BodyStyle
+                : masterTextStyles?.OtherStyle;
+        if (GetLevelPpr(masterStyle, level) is { } masterStylePpr)
+            yield return masterStylePpr;
+
+        var presentationPart = part.GetParentParts().OfType<PresentationPart>().FirstOrDefault()
+            ?? masterPart?.GetParentParts().OfType<PresentationPart>().FirstOrDefault();
+        var defaultTextStyle = presentationPart?.Presentation?.DefaultTextStyle;
+        if (GetLevelPpr(defaultTextStyle, level) is { } defaultPpr)
+            yield return defaultPpr;
+    }
+
+    private static OpenXmlElement? MatchingPlaceholderLevelPpr(
+        OpenXmlCompositeElement? tree, PlaceholderShape ph, int level)
+    {
+        if (tree == null) return null;
                 foreach (var candidate in tree.Elements<Shape>())
                 {
-                    var cPh = candidate.NonVisualShapeProperties?.ApplicationNonVisualDrawingProperties
+            var candidatePh = candidate.NonVisualShapeProperties?.ApplicationNonVisualDrawingProperties
                         ?.GetFirstChild<PlaceholderShape>();
-                    if (cPh == null) continue;
-                    if (!PlaceholderMatches(ph, cPh)) continue;
-                    var cLstStyle = candidate.TextBody?.GetFirstChild<Drawing.ListStyle>();
-                    if (GetLevelPpr(cLstStyle, level) is { } cppr && match(cppr)) return cppr;
+            if (candidatePh == null || !PlaceholderMatches(ph, candidatePh)) continue;
+            var candidateProperties = GetLevelPpr(
+                candidate.TextBody?.GetFirstChild<Drawing.ListStyle>(), level);
+            if (candidateProperties != null) return candidateProperties;
                 }
+        return null;
             }
 
-            var masterTxStyles = slidePart.SlideLayoutPart?.SlideMasterPart?.SlideMaster?.TextStyles;
-            if (masterTxStyles != null)
+    private static void MergeMissingLevelProperties(OpenXmlElement target, OpenXmlElement source)
             {
-                OpenXmlCompositeElement? styleList = isTitle ? masterTxStyles.TitleStyle
-                    : (isSubTitle || phType == PlaceholderValues.Body || phType == PlaceholderValues.Object)
-                        ? masterTxStyles.BodyStyle
-                        : masterTxStyles.OtherStyle;
-                if (GetLevelPpr(styleList, level) is { } sppr && match(sppr)) return sppr;
+        foreach (var attribute in source.GetAttributes())
+        {
+            if (target.GetAttributes().Any(existing =>
+                existing.LocalName == attribute.LocalName && existing.NamespaceUri == attribute.NamespaceUri))
+                continue;
+            target.SetAttribute(attribute);
             }
+
+        var targetHasBulletKind = target.ChildElements.Any(IsBulletKind);
+        foreach (var child in source.ChildElements)
+        {
+            if (IsBulletKind(child) && targetHasBulletKind) continue;
+            if (target.ChildElements.Any(existing =>
+                existing.LocalName == child.LocalName && existing.NamespaceUri == child.NamespaceUri))
+                continue;
+            target.AppendChild(child.CloneNode(true));
+            if (IsBulletKind(child)) targetHasBulletKind = true;
         }
-        return null;
     }
+
+    private static bool IsBulletKind(OpenXmlElement element) =>
+        element.LocalName is "buChar" or "buAutoNum" or "buNone" or "buBlip";
 
     /// <summary>
     /// Get the level paragraph-properties element (Level1ParagraphProperties etc.) for a
