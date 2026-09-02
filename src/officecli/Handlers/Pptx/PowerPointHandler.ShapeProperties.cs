@@ -3895,7 +3895,7 @@ public partial class PowerPointHandler
     /// </summary>
     internal static string? CheckTextOverflow(Shape shape)
     {
-        var text = GetShapeText(shape);
+        var text = GetShapeText(shape)?.TrimEnd('\r', '\n');
         if (string.IsNullOrEmpty(text)) return null;
         var spPr = shape.ShapeProperties;
         var xfrm = spPr?.Transform2D;
@@ -3930,6 +3930,16 @@ public partial class PowerPointHandler
             // overflow. Skip the size-based check in both cases.
             if (bp.GetFirstChild<Drawing.NormalAutoFit>() != null
                 || bp.GetFirstChild<Drawing.ShapeAutoFit>() != null)
+            {
+                return null;
+            }
+
+            // Explicit no-autofit and wrap=none both tell PowerPoint to keep
+            // the authored font size and allow text outside the shape bounds.
+            // The HTML renderer follows the same contract, so this is
+            // intentional overflow rather than clipping that needs repair.
+            if (bp.GetFirstChild<Drawing.NoAutoFit>() != null
+                || bp.Wrap?.Value == Drawing.TextWrappingValues.None)
             {
                 return null;
             }
@@ -4064,7 +4074,13 @@ public partial class PowerPointHandler
             totalLines += linesForSegment;
         }
 
-        double estimatedHeight = totalLines * lineHeight
+        // A single line needs the glyph box, not inter-line leading. Applying
+        // the font's full line pitch here reports compact zero-inset labels as
+        // clipped even though PowerPoint renders them intact.
+        double estimatedLineHeight = totalLines == 1 && fixedLineSpacingPt == null
+            ? fontSizePt * lineSpacingMultiplier
+            : lineHeight;
+        double estimatedHeight = totalLines * estimatedLineHeight
             + spaceBeforePt + spaceAfterPt * Math.Max(textLines.Length - 1, 0);
         if (estimatedHeight > usableHeight * 1.05) // 5% tolerance for rounding
         {

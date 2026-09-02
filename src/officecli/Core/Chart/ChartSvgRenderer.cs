@@ -3156,6 +3156,7 @@ internal partial class ChartSvgRenderer
         /// &lt;c:catAx&gt;&lt;c:txPr&gt;&lt;a:bodyPr rot="..."/&gt; (OOXML rot is
         /// 1/60000 degree). Null = no rotation (labels horizontal, default).</summary>
         public int? CatAxisLabelRotationDeg { get; set; }
+        public string? CatNumFmt { get; set; }
         /// <summary>Value-axis tick-label rotation in degrees (analogous to
         /// CatAxisLabelRotationDeg). Null = no rotation.</summary>
         public int? ValAxisLabelRotationDeg { get; set; }
@@ -3199,6 +3200,8 @@ internal partial class ChartSvgRenderer
         /// <summary>Category axis &lt;c:majorTickMark val="..."/&gt; ("out"/"in"/"cross"/"none"). Null when absent.</summary>
         public string? CatMajorTickMark { get; set; }
         public int CatTickLabelSkip { get; set; } = 1;
+        public bool HasExplicitCatTickLabelSkip { get; set; }
+        public bool IsDateAxis { get; set; }
         public int DataLabelFontPx { get; set; } = 8;
         /// <summary>Explicit data-label text color from &lt;c:dLbls&gt;&lt;c:txPr&gt;
         /// (bare-hex resolved via theme), or null to use the theme text color.</summary>
@@ -3556,7 +3559,9 @@ internal partial class ChartSvgRenderer
         // Axis info
         var valAxes = plotArea.Elements().Where(e => e.LocalName == "valAx").ToList();
         var valAxis = valAxes.FirstOrDefault();
-        var catAxis = plotArea.Elements().FirstOrDefault(e => e.LocalName == "catAx");
+        var catAxis = plotArea.Elements().FirstOrDefault(e => e.LocalName == "catAx")
+            ?? plotArea.Elements().FirstOrDefault(e => e.LocalName == "dateAx");
+        info.IsDateAxis = catAxis?.LocalName == "dateAx";
 
         // A second value axis carries the secondary (combo right-side) title, or —
         // for bubble/scatter charts that have no catAx — the Y-axis title. Emit it
@@ -3732,6 +3737,7 @@ internal partial class ChartSvgRenderer
             info.CatMajorTickMark = catTickEl?.GetAttributes().FirstOrDefault(a => a.LocalName == "val").Value;
             // tickLblSkip: thin category labels to every Nth (read but never rendered before).
             var catLblSkipEl = catAxis.Elements().FirstOrDefault(e => e.LocalName == "tickLblSkip");
+            info.HasExplicitCatTickLabelSkip = catLblSkipEl != null;
             if (catLblSkipEl != null
                 && int.TryParse(catLblSkipEl.GetAttributes().FirstOrDefault(a => a.LocalName == "val").Value, out var catLblSkip)
                 && catLblSkip > 1)
@@ -3742,6 +3748,9 @@ internal partial class ChartSvgRenderer
             // <c:tickLblPos val="none"/>: hide category-axis labels (keep line/gridlines).
             var catTlpEl = catAxis.Elements().FirstOrDefault(e => e.LocalName == "tickLblPos");
             info.CatTickLabelsHidden = catTlpEl?.GetAttributes().FirstOrDefault(a => a.LocalName == "val").Value == "none";
+            var catNumFmtEl = catAxis.Elements().FirstOrDefault(e => e.LocalName == "numFmt");
+            info.CatNumFmt = catNumFmtEl?.GetAttributes()
+                .FirstOrDefault(a => a.LocalName == "formatCode").Value;
             var catTitleEl = catAxis.Elements().FirstOrDefault(e => e.LocalName == "title");
             info.CatAxisTitle = catTitleEl?.Descendants<Drawing.Text>().FirstOrDefault()?.Text;
             var catTitleRPr = catTitleEl?.Descendants<Drawing.RunProperties>().FirstOrDefault();
@@ -3762,6 +3771,10 @@ internal partial class ChartSvgRenderer
             if (catDefRPr?.Bold?.HasValue == true) info.CatFontBold = catDefRPr.Bold.Value;
             if (catDefRPr?.Italic?.HasValue == true) info.CatFontItalic = catDefRPr.Italic.Value;
             info.CatAxisLabelRotationDeg = ExtractAxisLabelRotationDeg(catTxPr);
+            if (info.IsDateAxis)
+                info.Categories = info.Categories
+                    .Select(category => FormatDateAxisCategory(category, info.CatNumFmt))
+                    .ToArray();
         }
 
         // Data label font size
@@ -4414,7 +4427,39 @@ internal partial class ChartSvgRenderer
         var bodyPr = txPr.Elements().FirstOrDefault(e => e.LocalName == "bodyPr");
         var rotVal = bodyPr?.GetAttributes().FirstOrDefault(a => a.LocalName == "rot").Value;
         if (rotVal == null || !int.TryParse(rotVal, out var rot) || rot == 0) return null;
-        return rot / 60000;
+        var degrees = rot / 60000;
+        return degrees is >= -90 and <= 90 ? degrees : null;
+    }
+
+    private static string FormatDateAxisCategory(string value, string? formatCode)
+    {
+        if (!double.TryParse(value, System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out var serial))
+            return value;
+        if (serial >= 60 && serial < 61) return "2/29/1900";
+        if (serial >= 1 && serial < 60) serial += 1;
+        try
+        {
+            var date = DateTime.FromOADate(serial);
+            var code = formatCode?.ToLowerInvariant() ?? "";
+            if (code.Contains("mmm"))
+            {
+                var pattern = code.Contains("yyyy") ? "d-MMM-yyyy"
+                    : code.Contains("yy") ? "d-MMM-yy" : "d-MMM";
+                return date.ToString(pattern, System.Globalization.CultureInfo.InvariantCulture);
+            }
+            if (code.Contains('/'))
+            {
+                var year = code.Contains("yyyy") ? date.Year.ToString("0000")
+                    : (date.Year % 100).ToString("00");
+                return $"{date.Month}/{date.Day}/{year}";
+            }
+            return date.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture);
+        }
+        catch
+        {
+            return value;
+        }
     }
 
     /// <summary>Extract line/outline color from spPr (ln > solidFill > srgbClr, or
@@ -4587,6 +4632,17 @@ internal partial class ChartSvgRenderer
         var plotW = svgW - marginLeft - marginRight;
         var plotH = svgH - marginTop - marginBottom;
         if (plotW < 10 || plotH < 10) return;
+
+        if (info.IsDateAxis && !info.HasExplicitCatTickLabelSkip && info.Categories.Length > 1)
+        {
+            var maxLabelLength = info.Categories.Max(category => (category ?? "").Length);
+            var labelWidth = Math.Max(info.CatFontPx, maxLabelLength * info.CatFontPx * 0.5);
+            if (info.CatAxisLabelRotationDeg is int rotation && rotation != 0)
+                labelWidth = Math.Max(info.CatFontPx,
+                    labelWidth * Math.Abs(Math.Cos(rotation * Math.PI / 180.0)));
+            var slotWidth = (double)plotW / (info.Categories.Length - 1);
+            CatTickLabelSkip = Math.Max(1, (int)Math.Ceiling((labelWidth + 4) / slotWidth));
+        }
 
         var chartType = info.ChartType;
 

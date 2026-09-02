@@ -544,7 +544,9 @@ public partial class PowerPointHandler
         Dictionary<string, string> themeColors, out string? firstStopColor)
     {
         firstStopColor = null;
-        var stops = gradFill.GradientStopList?.Elements<Drawing.GradientStop>().ToList();
+        var stops = gradFill.GradientStopList?.Elements<Drawing.GradientStop>()
+            .OrderBy(stop => stop.Position?.Value ?? 0)
+            .ToList();
         if (stops == null || stops.Count < 2) return "";
 
         // Map the OOXML linear gradient angle to SVG x1/y1/x2/y2 in objectBoundingBox
@@ -611,7 +613,9 @@ public partial class PowerPointHandler
 
     private static string GradientToCss(Drawing.GradientFill gradFill, Dictionary<string, string> themeColors)
     {
-        var stops = gradFill.GradientStopList?.Elements<Drawing.GradientStop>().ToList();
+        var stops = gradFill.GradientStopList?.Elements<Drawing.GradientStop>()
+            .OrderBy(stop => stop.Position?.Value ?? 0)
+            .ToList();
         if (stops == null || stops.Count < 2) return "transparent";
 
         var cssStops = new List<string>();
@@ -1479,12 +1483,16 @@ public partial class PowerPointHandler
         return $"clip-path:polygon({a:0.##}% 0,{100 - a:0.##}% 0,100% 100%,0 100%)";
     }
 
-    /// <summary>R19 BUG A: chevron (right-pointing) honoring adj1 (notch depth
-    /// fraction, ×100000; default 50000).
-    /// polygon (0,0)(100-a,0)(100,50)(100-a,100)(0,100)(a,50).</summary>
-    private static string ChevronPolygon(Drawing.PresetGeometry? presetGeom)
+    /// <summary>Chevron honoring adj1. OOXML measures the notch/head depth
+    /// against the short side, so a wide banner keeps shallow ends.</summary>
+    private static string ChevronPolygon(long widthEmu, long heightEmu,
+        Drawing.PresetGeometry? presetGeom)
     {
-        var a = Math.Clamp(ReadAdjValueCss(presetGeom, 0, 50000) / 100000.0 * 100.0, 0, 100);
+        var adj = Math.Clamp(ReadAdjValueCss(presetGeom, 0, 50000), 0, 100000);
+        var a = widthEmu > 0 && heightEmu > 0
+            ? Math.Min(widthEmu, heightEmu) * adj / 100000.0 / widthEmu * 100.0
+            : adj / 1000.0;
+        a = Math.Clamp(a, 0, 100);
         return $"clip-path:polygon(0 0,{100 - a:0.##}% 0,100% 50%,{100 - a:0.##}% 100%,0 100%,{a:0.##}% 50%)";
     }
 
@@ -2425,7 +2433,7 @@ public partial class PowerPointHandler
         // R19 BUG A: parametric quads/polys honoring avLst (slant/notch/inset)
         if (preset == "parallelogram") return ParallelogramPolygon(presetGeom);
         if (preset == "trapezoid") return TrapezoidPolygon(presetGeom);
-        if (preset == "chevron") return ChevronPolygon(presetGeom);
+        if (preset == "chevron") return ChevronPolygon(widthEmu, heightEmu, presetGeom);
         if (preset == "hexagon") return HexagonPolygon(presetGeom);
         // triangle/isosTriangle: adj = apex horizontal position (fraction*100000,
         // default 50000 = centered). A non-default adj shifts the apex, making a

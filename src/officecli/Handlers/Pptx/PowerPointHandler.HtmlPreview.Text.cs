@@ -64,6 +64,8 @@ public partial class PowerPointHandler
         foreach (var para in textBody.Elements<Drawing.Paragraph>())
         {
             bool isLastPara = ReferenceEquals(para, lastParaRef);
+            var pProps = para.ParagraphProperties;
+            var paraDefRp = pProps?.GetFirstChild<Drawing.DefaultRunProperties>();
             // Resolve per-paragraph font size based on paragraph level
             int? defaultFontSizeHundredths = null;
             // R7-2: inherited default run color from the placeholder/master cascade.
@@ -81,6 +83,7 @@ public partial class PowerPointHandler
             Drawing.DefaultRunProperties? inheritedUnderlineRp = null;
             Drawing.DefaultRunProperties? inheritedStrikeRp = null;
             Drawing.DefaultRunProperties? inheritedSpacingRp = null;
+            Drawing.DefaultRunProperties? inheritedTypefaceRp = null;
             if (placeholderShape != null && placeholderPart != null)
             {
                 int level = para.ParagraphProperties?.Level?.Value ?? 0;
@@ -116,13 +119,24 @@ public partial class PowerPointHandler
                 // dropped (PowerPoint renders wide tracking; the preview rendered normal).
                 inheritedSpacingRp = ResolvePlaceholderDefRp(placeholderShape, placeholderPart, level,
                     dr => dr.Spacing?.HasValue == true);
+                inheritedTypefaceRp = ResolvePlaceholderDefRp(placeholderShape, placeholderPart, level,
+                    dr => dr.GetFirstChild<Drawing.LatinFont>() != null
+                        || dr.GetFirstChild<Drawing.EastAsianFont>() != null
+                        || dr.GetFirstChild<Drawing.ComplexScriptFont>() != null);
             }
             // R11-3: style-matrix fontRef schemeClr is the FINAL fallback run color
             // when no explicit run color and no inherited placeholder color is found.
             defaultRunColor ??= fontRefDefaultColor;
+            int? paragraphDefaultFontSizeHundredths = paraDefRp?.FontSize?.HasValue == true
+                ? paraDefRp.FontSize.Value
+                : defaultFontSizeHundredths;
+            var paragraphDefaultRunColor = ResolveFillColor(
+                paraDefRp?.GetFirstChild<Drawing.SolidFill>(), themeColors) ?? defaultRunColor;
+            var paragraphFontFallback = ResolveDefaultRunTypeface(paraDefRp, placeholderPart)
+                ?? ResolveDefaultRunTypeface(inheritedTypefaceRp, placeholderPart)
+                ?? themeFontFallback;
             var paraStyles = new List<string>();
 
-            var pProps = para.ParagraphProperties;
             // R26-4: alignment — explicit slide pPr@algn wins; otherwise inherit
             // the master/layout lvlNpPr@algn via the placeholder cascade.
             var algnInner = pProps?.Alignment?.HasValue == true
@@ -159,7 +173,7 @@ public partial class PowerPointHandler
             // font size (300000 = 300%). Mirror the bullet-size resolution
             // chain (first run size > placeholder/default > 18pt body default).
             var spcFontHundredths = para.Elements<Drawing.Run>().FirstOrDefault()?.RunProperties?.FontSize?.Value
-                ?? defaultFontSizeHundredths ?? 1800;
+                ?? paragraphDefaultFontSizeHundredths ?? 1800;
 
             // Issue #236: the paragraph div carries the line-height, so it must
             // also carry a font-size — otherwise the CSS strut resolves against
@@ -170,10 +184,10 @@ public partial class PowerPointHandler
             int paraMaxFontHundredths = 0;
             foreach (var r0 in para.Elements<Drawing.Run>())
             {
-                int sz = r0.RunProperties?.FontSize?.Value ?? defaultFontSizeHundredths ?? 1800;
+                int sz = r0.RunProperties?.FontSize?.Value ?? paragraphDefaultFontSizeHundredths ?? 1800;
                 if (sz > paraMaxFontHundredths) paraMaxFontHundredths = sz;
             }
-            if (paraMaxFontHundredths == 0) paraMaxFontHundredths = defaultFontSizeHundredths ?? 1800;
+            if (paraMaxFontHundredths == 0) paraMaxFontHundredths = paragraphDefaultFontSizeHundredths ?? 1800;
             paraStyles.Add($"font-size:{paraMaxFontHundredths / 100.0 * fontScale:0.##}pt");
             // PowerPoint single spacing is the font's line pitch (hhea/OS2
             // ascent+descent+lineGap ≈ 1.2× for Latin faces, ~1.32× for CJK
@@ -186,7 +200,7 @@ public partial class PowerPointHandler
                 ?? firstRp?.GetFirstChild<Drawing.EastAsianFont>()?.Typeface?.Value;
             if (paraTypeface != null && paraTypeface.StartsWith("+", StringComparison.Ordinal))
                 paraTypeface = ResolveThemeFontToken(placeholderPart, paraTypeface) ?? themeFontFallback;
-            paraTypeface ??= themeFontFallback;
+            paraTypeface ??= paragraphFontFallback;
             double singleRatio = SingleSpacingPitch(paraTypeface);
             // R26-2: spaceBefore — explicit slide pPr wins; otherwise inherit the
             // master/layout lvlNpPr spcBef via the placeholder cascade.
@@ -500,7 +514,7 @@ public partial class PowerPointHandler
                     // Terminal 1800 (18pt) fallback mirrors RenderRun: when no size is
                     // set anywhere in the chain, the run renders at the 18pt spec default,
                     // so the bullet must match it (else the bullet shrinks to browser default).
-                    var baseSizeHundredths = firstRun?.RunProperties?.FontSize?.Value ?? defaultFontSizeHundredths ?? 1800;
+                    var baseSizeHundredths = firstRun?.RunProperties?.FontSize?.Value ?? paragraphDefaultFontSizeHundredths ?? 1800;
                     {
                         var pct = buSzPct?.Val?.HasValue == true ? buSzPct.Val.Value / 100000.0 : 1.0;
                         buStyles.Add($"font-size:{baseSizeHundredths / 100.0 * pct * fontScale:0.##}pt");
@@ -580,7 +594,7 @@ public partial class PowerPointHandler
                 // > endParaRPr sz > inherited placeholder default > 18pt.
                 var emptySzHundredths = runs.FirstOrDefault()?.RunProperties?.FontSize?.Value
                     ?? para.GetFirstChild<Drawing.EndParagraphRunProperties>()?.FontSize?.Value
-                    ?? defaultFontSizeHundredths
+                    ?? paragraphDefaultFontSizeHundredths
                     ?? 1800;
                 sb.Append($"<span style=\"font-size:{emptySzHundredths / 100.0 * fontScale:0.##}pt\">&nbsp;</span>");
             }
@@ -592,7 +606,6 @@ public partial class PowerPointHandler
                 // master/layout placeholder inheritance but BELOW an explicit run rPr.
                 // Previously dropped entirely (e.g. <a:pPr><a:defRPr u="sng"/></a:pPr>
                 // rendered without the underline PowerPoint applies).
-                var paraDefRp = pProps?.GetFirstChild<Drawing.DefaultRunProperties>();
                 // R26-3: inherited default bold/italic — paragraph defRPr wins over the
                 // master/layout placeholder defRPr; applied when the run sets neither.
                 bool? inhBold = paraDefRp?.Bold?.HasValue == true ? paraDefRp.Bold.Value
@@ -617,8 +630,8 @@ public partial class PowerPointHandler
                 int? inhSpc = paraDefRp?.Spacing?.HasValue == true ? paraDefRp.Spacing.Value
                     : inheritedSpacingRp?.Spacing?.HasValue == true ? inheritedSpacingRp.Spacing.Value : null;
                 // Paragraph defRPr font size / color override the placeholder defaults.
-                int? paraSize = paraDefRp?.FontSize?.HasValue == true ? paraDefRp.FontSize.Value : defaultFontSizeHundredths;
-                var paraColor = ResolveFillColor(paraDefRp?.GetFirstChild<Drawing.SolidFill>(), themeColors) ?? defaultRunColor;
+                int? paraSize = paragraphDefaultFontSizeHundredths;
+                var paraColor = paragraphDefaultRunColor;
                 // R63: walk the paragraph's children IN DOCUMENT ORDER so that a
                 // soft line break (<a:br>, Drawing.Break) interleaved between runs
                 // emits its <br> at the right position. Previously runs were all
@@ -630,7 +643,7 @@ public partial class PowerPointHandler
                 {
                     if (child is Drawing.Run run)
                     {
-                        RenderRun(sb, run, themeColors, paraSize, placeholderPart, themeFontFallback, fontScale, paraColor, inhBold, inhItalic, tabCtx, inhCap, inhU, inhStrike, inhSpc);
+                        RenderRun(sb, run, themeColors, paraSize, placeholderPart, paragraphFontFallback, fontScale, paraColor, inhBold, inhItalic, tabCtx, inhCap, inhU, inhStrike, inhSpc);
                     }
                     else if (child is Drawing.Break)
                     {
@@ -654,7 +667,7 @@ public partial class PowerPointHandler
                         if (fldRpr != null)
                             fldRun.RunProperties = (Drawing.RunProperties)fldRpr.CloneNode(true);
                         fldRun.Text = new Drawing.Text(fldText);
-                        RenderRun(sb, fldRun, themeColors, paraSize, placeholderPart, themeFontFallback, fontScale, paraColor, inhBold, inhItalic, tabCtx, inhCap, inhU, inhStrike, inhSpc);
+                        RenderRun(sb, fldRun, themeColors, paraSize, placeholderPart, paragraphFontFallback, fontScale, paraColor, inhBold, inhItalic, tabCtx, inhCap, inhU, inhStrike, inhSpc);
                     }
                 }
             }
@@ -1137,7 +1150,7 @@ public partial class PowerPointHandler
             // solidFill child (default black when absent). paint-order:stroke fill
             // keeps the fill painted on top so the stroke hugs the glyph outside.
             var runOutline = rp.GetFirstChild<Drawing.Outline>();
-            if (runOutline != null)
+            if (runOutline != null && runOutline.GetFirstChild<Drawing.NoFill>() == null)
             {
                 double strokePx = runOutline.Width?.HasValue == true
                     ? Units.EmuToPt(runOutline.Width.Value) * 4.0 / 3.0
@@ -1352,6 +1365,17 @@ public partial class PowerPointHandler
     // whose master->theme chain is incomplete). kind is "major" or "minor".
     private static string? ResolveThemeFontTypeface(OpenXmlPart? part, string kind)
         => ResolveThemeFont(part, major: kind == "major", slot: "lt");
+
+    private static string? ResolveDefaultRunTypeface(Drawing.DefaultRunProperties? properties, OpenXmlPart? part)
+    {
+        var typeface = properties?.GetFirstChild<Drawing.LatinFont>()?.Typeface?.Value
+            ?? properties?.GetFirstChild<Drawing.EastAsianFont>()?.Typeface?.Value
+            ?? properties?.GetFirstChild<Drawing.ComplexScriptFont>()?.Typeface?.Value;
+        if (string.IsNullOrEmpty(typeface)) return null;
+        return typeface.StartsWith("+", StringComparison.Ordinal)
+            ? ResolveThemeFontToken(part, typeface)
+            : typeface;
+    }
 
     // Resolve a theme font reference token of the form "+{mj|mn}-{lt|ea|cs}"
     // (e.g. "+mj-lt", "+mn-ea") to its concrete typeface. The prefix picks

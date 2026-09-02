@@ -288,7 +288,8 @@ public partial class PowerPointHandler
                 var pathLst = custGeom.GetFirstChild<Drawing.PathList>();
                 var subPaths = pathLst?.Elements<Drawing.Path>().ToList() ?? new List<Drawing.Path>();
                 var needsSvg = subPaths.Count > 1
-                    || subPaths.Any(p => p.Fill?.Value == Drawing.PathFillModeValues.None);
+                    || subPaths.Any(p => p.Fill?.Value == Drawing.PathFillModeValues.None)
+                    || shape.ShapeProperties?.GetFirstChild<Drawing.NoFill>() != null;
 
                 if (needsSvg)
                 {
@@ -582,9 +583,16 @@ public partial class PowerPointHandler
                 sb.Append($"<defs>{gradFillDef}</defs>");
             if (drawFill)
                 sb.Append($"<path d=\"{custGeomSvgFillD}\" fill=\"{fillAttr}\" fill-rule=\"evenodd\"/>");
-            if (!string.IsNullOrEmpty(custGeomSvgStrokeD) && parsedOutline != null)
+            var custGeomOutline = parsedOutline;
+            if (custGeomOutline == null)
             {
-                var (bw, dt, bc, cap, _, join) = parsedOutline.Value;
+                var styleStroke = ResolveStyleLineRefStroke(shape.ShapeStyle, part, themeColors);
+                if (styleStroke != null)
+                    custGeomOutline = (styleStroke.Value.widthPt, "solid", styleStroke.Value.color, "flat", "sng", "miter");
+            }
+            if (!string.IsNullOrEmpty(custGeomSvgStrokeD) && custGeomOutline != null)
+            {
+                var (bw, dt, bc, cap, _, join) = custGeomOutline.Value;
                 var dashArr = DashTypeToSvgDasharray(dt, bw);
                 var dashAttr = !string.IsNullOrEmpty(dashArr) ? $" stroke-dasharray=\"{dashArr}\"" : "";
                 var linecap = CapToSvgLinecap(cap);
@@ -824,7 +832,7 @@ public partial class PowerPointHandler
         }
 
         // SVG border overlay for non-solid outlines (dashed, dotted, dashDot etc.)
-        if (parsedOutline != null && parsedOutline.Value.dashType != "solid")
+        if (!custGeomSvgRouted && parsedOutline != null && parsedOutline.Value.dashType != "solid")
         {
             var (bw, dt, bc, cap, _, join) = parsedOutline.Value;
             var dashArr = DashTypeToSvgDasharray(dt, bw);
@@ -1146,15 +1154,15 @@ public partial class PowerPointHandler
     /// </summary>
     private static int? ResolvePlaceholderFontSize(Shape shape, OpenXmlPart part, int level = 0)
     {
-        var ph = shape.NonVisualShapeProperties?.ApplicationNonVisualDrawingProperties
-            ?.GetFirstChild<PlaceholderShape>();
-        if (ph == null) return null; // Not a placeholder
-
-        // 1. Check shape's own list style for the paragraph's level
+        // Shape-local list styles apply to every text shape, not only placeholders.
         var lstStyle = shape.TextBody?.GetFirstChild<Drawing.ListStyle>();
         var defRp = GetLevelDefRp(lstStyle, level);
         if (defRp?.FontSize?.HasValue == true)
             return defRp.FontSize.Value;
+
+        var ph = shape.NonVisualShapeProperties?.ApplicationNonVisualDrawingProperties
+            ?.GetFirstChild<PlaceholderShape>();
+        if (ph == null) return null; // Not a placeholder
 
         // Determine placeholder category
         var phType = ph.Type?.HasValue == true ? ph.Type.Value : PlaceholderValues.Body;
@@ -1267,13 +1275,14 @@ public partial class PowerPointHandler
     private static OpenXmlElement? ResolvePlaceholderLevelPpr(Shape shape, OpenXmlPart part,
         int level, Func<OpenXmlElement, bool> match)
     {
+        // Shape-local list styles apply before any placeholder cascade and remain
+        // effective for ordinary textboxes and autoshapes.
+        var lstStyle = shape.TextBody?.GetFirstChild<Drawing.ListStyle>();
+        if (GetLevelPpr(lstStyle, level) is { } own && match(own)) return own;
+
         var ph = shape.NonVisualShapeProperties?.ApplicationNonVisualDrawingProperties
             ?.GetFirstChild<PlaceholderShape>();
         if (ph == null) return null;
-
-        // 1. Shape's own list style
-        var lstStyle = shape.TextBody?.GetFirstChild<Drawing.ListStyle>();
-        if (GetLevelPpr(lstStyle, level) is { } own && match(own)) return own;
 
         var phType = ph.Type?.HasValue == true ? ph.Type.Value : PlaceholderValues.Body;
         bool isTitle = phType == PlaceholderValues.Title || phType == PlaceholderValues.CenteredTitle;
@@ -2041,13 +2050,7 @@ public partial class PowerPointHandler
 
         if (hasHead || hasTail)
         {
-            // R37-A: marker dimensions are in strokeWidth units (SVG default
-            // markerUnits="strokeWidth"), so the rendered arrowhead size is
-            // markerWidth × strokeWidth. The base must therefore be a SMALL CONSTANT
-            // (NOT multiplied by lineWidth) — otherwise the effective size grows as
-            // O(lineWidth²). A "med" triangle in PowerPoint is ~3-4.5× the stroke width,
-            // so base ≈ 4 gives the right proportion and scales LINEARLY with the line.
-            var baseArrowSize = 4.0;
+            var baseArrowSize = Math.Max(6.0, lineWidth * 4.0 * 96.0 / 72.0);
             // R4-5: scale the marker by the head/tail @w / @len size enum
             // (sm/med/lg) so a large arrowhead renders visibly bigger than the
             // default; previously arrowSize was uniform and ignored @w/@len.
@@ -2086,13 +2089,13 @@ public partial class PowerPointHandler
             if (hasHead)
             {
                 var hid = $"ah{markerSeq}";
-                defs.Append($"<marker id=\"{hid}\" markerWidth=\"{headLen:0.#}\" markerHeight=\"{headW:0.#}\" refX=\"{headLen:0.#}\" refY=\"{headW / 2:0.#}\" orient=\"auto-start-reverse\">{ArrowMarkerGeometry(headEnd!.Type!.InnerText ?? "triangle", headLen, headW, safeColor)}</marker>");
+                defs.Append($"<marker id=\"{hid}\" markerUnits=\"userSpaceOnUse\" markerWidth=\"{headLen:0.#}\" markerHeight=\"{headW:0.#}\" refX=\"{headLen:0.#}\" refY=\"{headW / 2:0.#}\" orient=\"auto-start-reverse\">{ArrowMarkerGeometry(headEnd!.Type!.InnerText ?? "triangle", headLen, headW, safeColor)}</marker>");
                 markerStartAttr = $" marker-start=\"url(#{hid})\"";
             }
             if (hasTail)
             {
                 var tid = $"at{markerSeq}";
-                defs.Append($"<marker id=\"{tid}\" markerWidth=\"{tailLen:0.#}\" markerHeight=\"{tailW:0.#}\" refX=\"{tailLen:0.#}\" refY=\"{tailW / 2:0.#}\" orient=\"auto\">{ArrowMarkerGeometry(tailEnd!.Type!.InnerText ?? "triangle", tailLen, tailW, safeColor)}</marker>");
+                defs.Append($"<marker id=\"{tid}\" markerUnits=\"userSpaceOnUse\" markerWidth=\"{tailLen:0.#}\" markerHeight=\"{tailW:0.#}\" refX=\"{tailLen:0.#}\" refY=\"{tailW / 2:0.#}\" orient=\"auto\">{ArrowMarkerGeometry(tailEnd!.Type!.InnerText ?? "triangle", tailLen, tailW, safeColor)}</marker>");
                 markerEndAttr = $" marker-end=\"url(#{tid})\"";
             }
             defs.Append("</defs>");
