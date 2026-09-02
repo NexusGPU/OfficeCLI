@@ -2802,15 +2802,11 @@ public partial class PowerPointHandler
             var hex = ParseHelpers.TryGetNamedColorHex(prstColor.Val!.InnerText);
             if (hex != null)
             {
-                var transformed = ApplyColorTransforms(hex, prstColor);
-                var solid = transformed.StartsWith('#') ? transformed[1..] : transformed;
-                var alpha = prstColor.GetFirstChild<Drawing.Alpha>()?.Val?.Value;
-                if (alpha.HasValue && alpha.Value < 100000)
-                {
-                    var (r, g, b) = ColorMath.HexToRgb(solid);
-                    return $"rgba({r},{g},{b},{alpha.Value / 100000.0:0.##})";
-                }
-                return $"#{solid}";
+                // ApplyColorTransforms already emits rgba() when <a:alpha> is
+                // present. Do not parse that CSS value as hex again: WPS decks
+                // commonly combine prstClr with alpha, and the old double-
+                // conversion raised FormatException during HTML rendering.
+                return ApplyColorTransforms(hex, prstColor);
             }
         }
 
@@ -2821,15 +2817,9 @@ public partial class PowerPointHandler
             var sysHex = SysColorHex(sysColor);
             if (sysHex != null)
             {
-                var transformed = ApplyColorTransforms(sysHex, sysColor);
-                var solid = transformed.StartsWith('#') ? transformed[1..] : transformed;
-                var alpha = sysColor.GetFirstChild<Drawing.Alpha>()?.Val?.Value;
-                if (alpha.HasValue && alpha.Value < 100000)
-                {
-                    var (r, g, b) = ColorMath.HexToRgb(solid);
-                    return $"rgba({r},{g},{b},{alpha.Value / 100000.0:0.##})";
-                }
-                return $"#{solid}";
+                // Keep the same single-pass transform/alpha handling as
+                // prstClr above; ApplyColorTransforms returns a CSS color.
+                return ApplyColorTransforms(sysHex, sysColor);
             }
         }
 
